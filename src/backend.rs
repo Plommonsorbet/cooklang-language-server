@@ -5,6 +5,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use crate::completion;
+use crate::completions::{ItemEntry, UnitEntry};
 use crate::diagnostics;
 use crate::hover;
 use crate::semantic_tokens;
@@ -25,6 +26,59 @@ impl Backend {
             state: ServerState::new(),
             workspace_root: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Replaces the built-in ingredient suggestions offered after `@`.
+    ///
+    /// Suggestions drawn from the open documents and from `aisle.conf` are
+    /// unaffected — only the built-in fallback list is replaced. An empty
+    /// vector suppresses fallback ingredient suggestions entirely.
+    ///
+    /// ```no_run
+    /// # use cooklang_language_server::{Backend, ItemEntry};
+    /// # use tower_lsp::LspService;
+    /// let (service, socket) = LspService::new(|client| {
+    ///     Backend::new(client).with_ingredients(vec![
+    ///         ItemEntry::new("gochujang"),
+    ///         ItemEntry {
+    ///             name: "doenjang".into(),
+    ///             category: Some("condiments".into()),
+    ///             ..Default::default()
+    ///         },
+    ///     ])
+    /// });
+    /// ```
+    pub fn with_ingredients(mut self, items: Vec<ItemEntry>) -> Self {
+        self.state.custom.ingredients = Some(items);
+        self
+    }
+
+    /// Replaces the built-in cookware suggestions offered after `#`.
+    ///
+    /// Cookware already used in the open document is unaffected. An empty
+    /// vector suppresses fallback cookware suggestions entirely.
+    pub fn with_cookware(mut self, items: Vec<ItemEntry>) -> Self {
+        self.state.custom.cookware = Some(items);
+        self
+    }
+
+    /// Replaces the built-in measurement units offered after `%`.
+    ///
+    /// Time units are a separate list: `%` offers both, so replacing only
+    /// this one leaves the built-in time units still merged in. An empty
+    /// vector suppresses fallback measurement units entirely.
+    pub fn with_units(mut self, units: Vec<UnitEntry>) -> Self {
+        self.state.custom.units = Some(units);
+        self
+    }
+
+    /// Replaces the built-in time units offered after `~`, and merged into
+    /// the suggestions offered after `%`.
+    ///
+    /// An empty vector suppresses fallback time units in both places.
+    pub fn with_time_units(mut self, units: Vec<UnitEntry>) -> Self {
+        self.state.custom.time_units = Some(units);
+        self
     }
 
     /// Try to load aisle.conf from the workspace

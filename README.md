@@ -82,9 +82,48 @@ Get real-time feedback on syntax errors and warnings:
 Context-aware suggestions triggered by:
 
 - `@` - Suggests ingredients from the current recipe and workspace
-- `#` - Suggests cookware (both used in recipe and common items like "pot", "pan", "oven")
+- `#` - Suggests cookware (both used in recipe and a built-in list of common items like "pot", "pan", "oven")
 - `~` - Suggests time units (seconds, minutes, hours)
 - `%` - Suggests measurement units (g, kg, ml, cups, tbsp, etc.)
+
+The built-in suggestion lists live in [`data/`](./data) and are embedded at
+compile time. An embedder can replace them — see below.
+
+### Custom Completion Lists
+
+When embedding the server as a library, the built-in fallback lists can be
+replaced at construction time with lists of your own:
+
+```rust
+use cooklang_language_server::{Backend, ItemEntry, UnitEntry};
+use tower_lsp::LspService;
+
+let (service, socket) = LspService::new(|client| {
+    Backend::new(client)
+        .with_ingredients(vec![
+            ItemEntry::new("gochujang"),
+            ItemEntry {
+                name: "doenjang".into(),
+                category: Some("condiments".into()),
+                ..Default::default()
+            },
+        ])
+        .with_cookware(vec![ItemEntry::new("donabe")])
+        .with_units(vec![UnitEntry::new("shaku", "shaku")])
+        .with_time_units(vec![UnitEntry::new("ks", "kiloseconds")])
+});
+```
+
+Each list is independent, and replacement is scoped tightly:
+
+- Only the built-in fallback tier is replaced. Suggestions drawn from the open
+  documents and from `aisle.conf` still appear, and still rank above it.
+- Lists you don't set keep their built-in contents — replacing ingredients
+  leaves the built-in cookware list alone.
+- An empty vector suppresses that list's fallback suggestions entirely.
+
+`with_time_units` affects both `~` and `%`, since `%` offers time units
+alongside measurement units. `with_units` affects `%` only.
 
 ### Syntax Highlighting
 

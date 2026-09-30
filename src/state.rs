@@ -4,6 +4,7 @@ use std::sync::RwLock;
 use dashmap::DashMap;
 use tower_lsp::lsp_types::Url;
 
+use crate::completions::CustomCompletions;
 use crate::document::Document;
 
 /// An ingredient from the aisle configuration with its category
@@ -82,6 +83,10 @@ pub struct ServerState {
     pub documents: DashMap<Url, Document>,
     /// Parsed aisle configuration for ingredient suggestions
     pub aisle_config: RwLock<Option<AisleConfig>>,
+    /// Fallback completion lists supplied by the embedder, replacing the
+    /// built-in ones per list. Set through the builder methods on `Backend`,
+    /// which own the state before it is served and so need no locking.
+    pub(crate) custom: CustomCompletions,
 }
 
 impl ServerState {
@@ -89,6 +94,7 @@ impl ServerState {
         Self {
             documents: DashMap::new(),
             aisle_config: RwLock::new(None),
+            custom: CustomCompletions::default(),
         }
     }
 

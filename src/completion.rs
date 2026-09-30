@@ -5,6 +5,7 @@ use tower_lsp::lsp_types::{
     CompletionTextEdit, Documentation, InsertTextFormat, Position, Range, TextEdit,
 };
 
+use crate::completions::{ItemEntry, UnitEntry};
 use crate::document::Document;
 use crate::state::ServerState;
 use crate::utils::position::position_to_offset;
@@ -63,9 +64,9 @@ pub fn get_completions(
 
     let items = match context {
         CompletionContext::Ingredient(prefix) => complete_ingredients(&prefix, doc, state),
-        CompletionContext::Cookware(prefix) => complete_cookware(&prefix, doc),
-        CompletionContext::Timer => complete_timer_units(),
-        CompletionContext::Unit(prefix) => complete_units(&prefix),
+        CompletionContext::Cookware(prefix) => complete_cookware(&prefix, doc, state),
+        CompletionContext::Timer => complete_timer_units(state),
+        CompletionContext::Unit(prefix) => complete_units(&prefix, state),
         CompletionContext::Quantity => complete_quantity_snippets(),
         CompletionContext::RecipeReference(prefix) => {
             if let Some(root) = workspace_root {
@@ -265,23 +266,71 @@ fn complete_ingredients(prefix: &str, doc: &Document, state: &ServerState) -> Ve
         }
     }
 
-    // Add common ingredients (lowest priority fallback)
-    for &ingredient in COMMON_INGREDIENTS.iter() {
-        if ingredient.to_lowercase().starts_with(&prefix_lower)
-            && !items.iter().any(|i| i.label == ingredient)
-        {
-            items.push(CompletionItem {
-                label: ingredient.into(),
-                kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some("Common ingredient".into()),
-                insert_text: Some(format!("{}{{$0}}", ingredient)),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            });
-        }
-    }
+    // Lowest priority fallback: the embedder's list when one was injected,
+    // otherwise the built-in one.
+    push_fallback_items(
+        &mut items,
+        state.custom.ingredients.as_deref(),
+        &COMMON_INGREDIENTS,
+        &prefix_lower,
+        CompletionItemKind::VARIABLE,
+        "Common ingredient",
+    );
 
     items
+}
+
+/// Push the lowest-priority suggestions for an ingredient or cookware list:
+/// the embedder's injected entries when a list was supplied, otherwise the
+/// built-in names. `generic_detail` is used for entries carrying neither a
+/// detail nor a category.
+fn push_fallback_items(
+    items: &mut Vec<CompletionItem>,
+    injected: Option<&[ItemEntry]>,
+    builtin: &[&'static str],
+    prefix_lower: &str,
+    kind: CompletionItemKind,
+    generic_detail: &str,
+) {
+    match injected {
+        Some(entries) => {
+            for entry in entries {
+                // Promoting `category` into the detail mirrors how aisle.conf
+                // entries are presented.
+                let detail = entry
+                    .detail
+                    .as_deref()
+                    .or(entry.category.as_deref())
+                    .unwrap_or(generic_detail);
+                push_fallback_item(items, &entry.name, detail, prefix_lower, kind);
+            }
+        }
+        None => {
+            for &name in builtin {
+                push_fallback_item(items, name, generic_detail, prefix_lower, kind);
+            }
+        }
+    }
+}
+
+fn push_fallback_item(
+    items: &mut Vec<CompletionItem>,
+    name: &str,
+    detail: &str,
+    prefix_lower: &str,
+    kind: CompletionItemKind,
+) {
+    if !name.to_lowercase().starts_with(prefix_lower) || items.iter().any(|i| i.label == name) {
+        return;
+    }
+    items.push(CompletionItem {
+        label: name.to_string(),
+        kind: Some(kind),
+        detail: Some(detail.to_string()),
+        insert_text: Some(format!("{}{{$0}}", name)),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..Default::default()
+    });
 }
 
 /// Scan a directory recursively for .cook and .menu files
@@ -411,7 +460,7 @@ fn complete_recipe_references(
         .collect()
 }
 
-fn complete_cookware(prefix: &str, doc: &Document) -> Vec<CompletionItem> {
+fn complete_cookware(prefix: &str, doc: &Document, state: &ServerState) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     let prefix_lower = prefix.to_lowercase();
 
@@ -432,66 +481,118 @@ fn complete_cookware(prefix: &str, doc: &Document) -> Vec<CompletionItem> {
         }
     }
 
-    // Add common cookware
-    for &cookware in COMMON_COOKWARE.iter() {
-        if cookware.to_lowercase().starts_with(&prefix_lower)
-            && !items.iter().any(|i| i.label == cookware)
-        {
-            items.push(CompletionItem {
-                label: cookware.into(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Common cookware".into()),
-                insert_text: Some(format!("{}{{$0}}", cookware)),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            });
-        }
-    }
-
-    items
-}
-
-fn complete_timer_units() -> Vec<CompletionItem> {
-    TIME_UNITS
-        .iter()
-        .map(|(short, long)| CompletionItem {
-            label: short.to_string(),
-            kind: Some(CompletionItemKind::UNIT),
-            detail: Some(long.to_string()),
-            documentation: Some(Documentation::String(format!("Time unit: {}", long))),
-            ..Default::default()
-        })
-        .collect()
-}
-
-fn complete_units(prefix: &str) -> Vec<CompletionItem> {
-    let prefix_lower = prefix.to_lowercase();
-
-    let mut items: Vec<_> = UNITS
-        .iter()
-        .filter(|(short, _)| short.to_lowercase().starts_with(&prefix_lower))
-        .map(|(short, long)| CompletionItem {
-            label: short.to_string(),
-            kind: Some(CompletionItemKind::UNIT),
-            detail: Some(long.to_string()),
-            ..Default::default()
-        })
-        .collect();
-
-    // Also add time units when completing units
-    items.extend(
-        TIME_UNITS
-            .iter()
-            .filter(|(short, _)| short.to_lowercase().starts_with(&prefix_lower))
-            .map(|(short, long)| CompletionItem {
-                label: short.to_string(),
-                kind: Some(CompletionItemKind::UNIT),
-                detail: Some(format!("{} (time)", long)),
-                ..Default::default()
-            }),
+    push_fallback_items(
+        &mut items,
+        state.custom.cookware.as_deref(),
+        &COMMON_COOKWARE,
+        &prefix_lower,
+        CompletionItemKind::CLASS,
+        "Common cookware",
     );
 
     items
+}
+
+fn complete_timer_units(state: &ServerState) -> Vec<CompletionItem> {
+    // `~` takes time units only; measurement units never apply to a timer.
+    match state.custom.time_units.as_deref() {
+        Some(entries) => entries
+            .iter()
+            .map(|entry| timer_item(&entry.symbol, entry.name.as_deref()))
+            .collect(),
+        None => TIME_UNITS
+            .iter()
+            .map(|(symbol, name)| timer_item(symbol, Some(name)))
+            .collect(),
+    }
+}
+
+fn timer_item(symbol: &str, name: Option<&str>) -> CompletionItem {
+    CompletionItem {
+        label: symbol.to_string(),
+        kind: Some(CompletionItemKind::UNIT),
+        detail: name.map(|name| name.to_string()),
+        documentation: name.map(|name| Documentation::String(format!("Time unit: {}", name))),
+        ..Default::default()
+    }
+}
+
+fn complete_units(prefix: &str, state: &ServerState) -> Vec<CompletionItem> {
+    let prefix_lower = prefix.to_lowercase();
+    let mut items = Vec::new();
+
+    push_unit_items(
+        &mut items,
+        state.custom.units.as_deref(),
+        &UNITS,
+        &prefix_lower,
+        false,
+    );
+    // Time units are offered here too, so a timer's units stay reachable
+    // from inside a quantity.
+    push_unit_items(
+        &mut items,
+        state.custom.time_units.as_deref(),
+        &TIME_UNITS,
+        &prefix_lower,
+        true,
+    );
+
+    items
+}
+
+/// Push unit suggestions from the embedder's injected list when one was
+/// supplied, otherwise from the built-in list. `time` marks the detail as a
+/// time unit, distinguishing the two lists that `%` merges.
+fn push_unit_items(
+    items: &mut Vec<CompletionItem>,
+    injected: Option<&[UnitEntry]>,
+    builtin: &[(&'static str, &'static str)],
+    prefix_lower: &str,
+    time: bool,
+) {
+    match injected {
+        Some(entries) => {
+            for entry in entries {
+                push_unit_item(
+                    items,
+                    &entry.symbol,
+                    entry.name.as_deref(),
+                    prefix_lower,
+                    time,
+                );
+            }
+        }
+        None => {
+            for (symbol, name) in builtin {
+                push_unit_item(items, symbol, Some(name), prefix_lower, time);
+            }
+        }
+    }
+}
+
+fn push_unit_item(
+    items: &mut Vec<CompletionItem>,
+    symbol: &str,
+    name: Option<&str>,
+    prefix_lower: &str,
+    time: bool,
+) {
+    if !symbol.to_lowercase().starts_with(prefix_lower) {
+        return;
+    }
+    let detail = match (name, time) {
+        (Some(name), true) => Some(format!("{} (time)", name)),
+        (Some(name), false) => Some(name.to_string()),
+        (None, true) => Some("time".to_string()),
+        (None, false) => None,
+    };
+    items.push(CompletionItem {
+        label: symbol.to_string(),
+        kind: Some(CompletionItemKind::UNIT),
+        detail,
+        ..Default::default()
+    });
 }
 
 fn complete_quantity_snippets() -> Vec<CompletionItem> {
@@ -518,8 +619,197 @@ fn complete_quantity_snippets() -> Vec<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completions::CustomCompletions;
+    use crate::state::AisleConfig;
     use std::fs;
     use tempfile::TempDir;
+    use tower_lsp::lsp_types::Url;
+
+    fn state_with(custom: CustomCompletions) -> ServerState {
+        let mut state = ServerState::new();
+        state.custom = custom;
+        state
+    }
+
+    fn doc(content: &str) -> Document {
+        Document::new(
+            Url::parse("file:///test.cook").unwrap(),
+            1,
+            content.to_string(),
+        )
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<String> {
+        items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn builtins_used_when_nothing_injected() {
+        let state = ServerState::new();
+        let found = labels(&complete_ingredients("", &doc(""), &state));
+        assert!(found.contains(&"salt".to_string()));
+        assert_eq!(found.len(), COMMON_INGREDIENTS.len());
+    }
+
+    #[test]
+    fn injected_ingredients_replace_builtins() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![ItemEntry::new("gochujang")]),
+            ..Default::default()
+        });
+        let found = labels(&complete_ingredients("", &doc(""), &state));
+        assert!(found.contains(&"gochujang".to_string()));
+        // "salt" heads data/ingredients.txt and must not leak through.
+        assert!(!found.contains(&"salt".to_string()));
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn empty_injected_list_suppresses_fallbacks() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![]),
+            ..Default::default()
+        });
+        assert!(complete_ingredients("", &doc(""), &state).is_empty());
+    }
+
+    #[test]
+    fn injecting_ingredients_leaves_cookware_builtins() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![ItemEntry::new("gochujang")]),
+            ..Default::default()
+        });
+        let found = labels(&complete_cookware("", &doc(""), &state));
+        assert!(found.contains(&"pot".to_string()));
+        assert_eq!(found.len(), COMMON_COOKWARE.len());
+    }
+
+    #[test]
+    fn document_and_aisle_ingredients_survive_injection() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![ItemEntry::new("gochujang")]),
+            ..Default::default()
+        });
+        *state.aisle_config.write().unwrap() = AisleConfig::parse("[produce]\nkohlrabi\n");
+
+        let found = labels(&complete_ingredients(
+            "",
+            &doc("Mix @tamarind{1%tbsp}."),
+            &state,
+        ));
+        assert!(
+            found.contains(&"tamarind".to_string()),
+            "document: {found:?}"
+        );
+        assert!(found.contains(&"kohlrabi".to_string()), "aisle: {found:?}");
+        assert!(
+            found.contains(&"gochujang".to_string()),
+            "injected: {found:?}"
+        );
+    }
+
+    #[test]
+    fn injected_items_respect_the_prefix_filter() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![ItemEntry::new("gochujang"), ItemEntry::new("miso")]),
+            ..Default::default()
+        });
+        assert_eq!(
+            labels(&complete_ingredients("go", &doc(""), &state)),
+            vec!["gochujang".to_string()]
+        );
+    }
+
+    #[test]
+    fn injected_units_do_not_reach_timer_completions() {
+        let state = state_with(CustomCompletions {
+            units: Some(vec![UnitEntry::new("shaku", "shaku")]),
+            ..Default::default()
+        });
+
+        let timer = labels(&complete_timer_units(&state));
+        assert!(!timer.contains(&"shaku".to_string()));
+        assert!(timer.contains(&"min".to_string()), "built-in time units");
+
+        // `%` merges both lists: injected measurement units, built-in time units.
+        let units = labels(&complete_units("", &state));
+        assert!(units.contains(&"shaku".to_string()));
+        assert!(units.contains(&"min".to_string()));
+        assert!(!units.contains(&"kg".to_string()), "builtin units replaced");
+    }
+
+    #[test]
+    fn injected_time_units_replace_timer_and_merge_into_units() {
+        let state = state_with(CustomCompletions {
+            time_units: Some(vec![UnitEntry::new("ks", "kiloseconds")]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            labels(&complete_timer_units(&state)),
+            vec!["ks".to_string()]
+        );
+
+        let units = labels(&complete_units("", &state));
+        assert!(units.contains(&"ks".to_string()));
+        assert!(
+            units.contains(&"kg".to_string()),
+            "measurement units intact"
+        );
+        assert!(!units.contains(&"min".to_string()));
+    }
+
+    #[test]
+    fn detail_falls_back_through_category_to_generic() {
+        let state = state_with(CustomCompletions {
+            ingredients: Some(vec![
+                ItemEntry {
+                    name: "aaa".into(),
+                    detail: Some("explicit".into()),
+                    category: Some("ignored".into()),
+                },
+                ItemEntry {
+                    name: "bbb".into(),
+                    detail: None,
+                    category: Some("condiments".into()),
+                },
+                ItemEntry::new("ccc"),
+            ]),
+            ..Default::default()
+        });
+
+        let items = complete_ingredients("", &doc(""), &state);
+        let detail = |label: &str| {
+            items
+                .iter()
+                .find(|i| i.label == label)
+                .unwrap()
+                .detail
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(detail("aaa"), "explicit");
+        assert_eq!(detail("bbb"), "condiments");
+        assert_eq!(detail("ccc"), "Common ingredient");
+    }
+
+    #[test]
+    fn unit_detail_marks_time_and_tolerates_missing_names() {
+        let state = state_with(CustomCompletions {
+            units: Some(vec![UnitEntry::symbol_only("sho")]),
+            time_units: Some(vec![
+                UnitEntry::new("ks", "kiloseconds"),
+                UnitEntry::symbol_only("ms"),
+            ]),
+            ..Default::default()
+        });
+
+        let items = complete_units("", &state);
+        let find = |label: &str| items.iter().find(|i| i.label == label).unwrap();
+        assert_eq!(find("sho").detail, None);
+        assert_eq!(find("ks").detail.as_deref(), Some("kiloseconds (time)"));
+        assert_eq!(find("ms").detail.as_deref(), Some("time"));
+    }
 
     #[test]
     fn test_context_recipe_reference_dot() {
